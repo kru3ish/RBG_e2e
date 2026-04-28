@@ -1,0 +1,52 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: create-service
+  title: Create a Service
+  description: Scaffold a new service with Harness CI wiring and auto-reconciliation
+  tags: [service, onboarding, golden-path]
+spec:
+  owner: group:platform-engineering
+  type: service
+  parameters:
+    - title: Service details
+      required: [service_name, target_project]
+      properties:
+        service_name:
+          title: Service name
+          type: string
+          description: "GitHub repo name (lowercase, alphanumeric + hyphens)"
+          pattern: "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+        target_project:
+          title: Target Harness project
+          type: string
+          description: Which Harness project this service lives in
+          enum:
+            - Solutions_Factory
+            - Image_Factory
+            - Core
+            - Sandbox
+            - default_project
+          enumNames:
+            - "Solutions Factory (Harness_Platform_Management)"
+            - "Image Factory (Harness_Platform_Management)"
+            - "Core (Platform)"
+            - "Sandbox (Playground)"
+            - "Default Project (default)"
+  steps:
+    - id: create-service
+      name: Create service
+      action: trigger:harness-custom-pipeline
+      input:
+        url: "https://app.harness.io/ng/account/Qjf4MwsLRUes1w_efM3eIw/module/iacm/orgs/Harness_Platform_Management/projects/Solutions_Factory/pipelines/create_service/pipeline-studio"
+        inputset:
+          service_name: ${{ parameters.service_name }}
+          target_project: ${{ parameters.target_project }}
+  output:
+    links:
+      - title: View new repo
+        url: "https://github.com/Kru3ish/${{ parameters.service_name }}"
+      - title: View pipeline execution
+        url: ${{ steps['create-service'].output.executionUrl }}
+      - title: View in Harness
+        url: "https://app.harness.io/ng/account/Qjf4MwsLRUes1w_efM3eIw/module/iacm/orgs/Harness_Platform_Management/projects/Solutions_Factory/pipelines/create_service/pipeline-studio"

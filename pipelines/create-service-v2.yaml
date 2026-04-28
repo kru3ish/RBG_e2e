@@ -1,0 +1,251 @@
+pipeline:
+  identifier: create_service_v2
+  name: Create a Service v2
+  orgIdentifier: Harness_Platform_Management
+  projectIdentifier: Solutions_Factory
+  description: "HSF Create-a-Service (Terraform): scaffolds GitHub repo, creates Harness service, sets up IACM workspace for triggers, and wires auto-reconciliation. All service logic is Terraform — no bash scripting."
+  tags:
+    hsf_managed: "true"
+    pipeline_type: "create_service"
+    version: "2"
+
+  variables:
+    - name: service_name
+      type: String
+      required: true
+      description: "Service name — becomes the GitHub repo name (lowercase, alphanumeric + hyphens)"
+      value: <+input>
+
+    - name: target_project
+      type: String
+      required: true
+      description: "Harness project where service resources are created"
+      value: <+input>.default(Solutions_Factory)
+
+    - name: target_org
+      type: String
+      required: false
+      description: "Harness org for the target project"
+      value: <+input>.default(Harness_Platform_Management)
+
+    - name: repo_org
+      type: String
+      required: false
+      description: "GitHub organization for the new repo"
+      value: <+input>.default(Kru3ish)
+
+    - name: pipeline_template_id
+      type: String
+      required: false
+      description: "CI pipeline identifier that triggers fire against"
+      value: <+input>.default(Build_and_Push)
+
+    - name: HARNESS_PLATFORM_KEY
+      type: Secret
+      required: true
+      description: "Harness API key for resource management"
+      value: account.harness_platform_api_key
+
+    - name: GITHUB_TOKEN_SECRET
+      type: Secret
+      required: true
+      description: "GitHub token for repo creation"
+      value: account.githubABC
+
+  stages:
+    # =========================================================
+    # Stage 0: Create the onboarding IACM workspace
+    # This is the only non-Terraform step — creates the workspace
+    # that holds the service-onboarding module's state.
+    # =========================================================
+    - stage:
+        name: Create Onboarding Workspace
+        identifier: Create_Onboarding_Workspace
+        description: "Create IACM workspace for the service-onboarding Terraform module"
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Create Workspace
+                  identifier: create_workspace
+                  timeout: 3m
+                  spec:
+                    shell: Bash
+                    command: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      API_KEY="$HARNESS_PLATFORM_API_KEY"
+                      ACCOUNT_ID="<+account.identifier>"
+                      ORG_ID="<+org.identifier>"
+                      PROJECT_ID="<+project.identifier>"
+                      BASE_URL="https://app.harness.io"
+
+                      SERVICE_NAME="<+pipeline.variables.service_name>"
+                      TARGET_ORG="<+pipeline.variables.target_org>"
+                      TARGET_PROJECT="<+pipeline.variables.target_project>"
+                      REPO_ORG="<+pipeline.variables.repo_org>"
+                      PIPELINE_TEMPLATE="<+pipeline.variables.pipeline_template_id>"
+
+                      SERVICE_ID=$(echo "$SERVICE_NAME" | tr '-' '_')
+                      WORKSPACE_ID="onboarding_${SERVICE_ID}"
+
+                      echo "=== Creating onboarding workspace: $WORKSPACE_ID ==="
+
+                      # Check if workspace already exists
+                      WS_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "x-api-key: $API_KEY" \
+                        "$BASE_URL/iacm/api/orgs/$ORG_ID/projects/$PROJECT_ID/workspaces/$WORKSPACE_ID?account_id=$ACCOUNT_ID")
+
+                      if [ "$WS_EXISTS" = "200" ]; then
+                        echo "Workspace already exists, skipping creation."
+                      else
+                        echo "Creating workspace..."
+                        RESP=$(curl -s -w "\n%{http_code}" \
+                          -X POST \
+                          -H "x-api-key: $API_KEY" \
+                          -H "Content-Type: application/json" \
+                          "$BASE_URL/iacm/api/orgs/$ORG_ID/projects/$PROJECT_ID/workspaces?account_id=$ACCOUNT_ID" \
+                          -d "{
+                            \"identifier\": \"$WORKSPACE_ID\",
+                            \"name\": \"Onboarding: $SERVICE_NAME\",
+                            \"description\": \"Creates GitHub repo, Harness service, IACM workspace, and watcher trigger for $SERVICE_NAME\",
+                            \"provisioner\": \"opentofu\",
+                            \"provisioner_version\": \"1.9.0\",
+                            \"repository\": \"kru3ish/RBG_e2e\",
+                            \"repository_connector\": \"account.github_public\",
+                            \"repository_branch\": \"main\",
+                            \"repository_path\": \"modules/service-onboarding\",
+                            \"provider_connector\": \"\",
+                            \"terraform_variables\": {
+                              \"v1\": {\"key\": \"service_name\", \"value\": \"$SERVICE_NAME\", \"value_type\": \"string\"},
+                              \"v2\": {\"key\": \"repo_org\", \"value\": \"$REPO_ORG\", \"value_type\": \"string\"},
+                              \"v3\": {\"key\": \"target_org\", \"value\": \"$TARGET_ORG\", \"value_type\": \"string\"},
+                              \"v4\": {\"key\": \"target_project\", \"value\": \"$TARGET_PROJECT\", \"value_type\": \"string\"},
+                              \"v5\": {\"key\": \"harness_account_id\", \"value\": \"$ACCOUNT_ID\", \"value_type\": \"string\"},
+                              \"v6\": {\"key\": \"harness_platform_api_key\", \"value\": \"$API_KEY\", \"value_type\": \"string\"},
+                              \"v7\": {\"key\": \"github_token\", \"value\": \"$GITHUB_TOKEN\", \"value_type\": \"string\"},
+                              \"v8\": {\"key\": \"pipeline_template_id\", \"value\": \"$PIPELINE_TEMPLATE\", \"value_type\": \"string\"},
+                              \"v9\": {\"key\": \"hsf_org\", \"value\": \"$ORG_ID\", \"value_type\": \"string\"},
+                              \"v10\": {\"key\": \"hsf_project\", \"value\": \"$PROJECT_ID\", \"value_type\": \"string\"}
+                            },
+                            \"environment_variables\": {},
+                            \"tags\": {
+                              \"managed_by\": \"hsf\",
+                              \"created_via\": \"create_service_v2\",
+                              \"service_name\": \"$SERVICE_NAME\"
+                            }
+                          }")
+                        HTTP=$(echo "$RESP" | tail -1)
+                        BODY=$(echo "$RESP" | sed '$d')
+                        if [[ "$HTTP" =~ ^2 ]]; then
+                          echo "Workspace created."
+                        else
+                          echo "ERROR: Failed to create workspace (HTTP $HTTP)"
+                          echo "$BODY"
+                          exit 1
+                        fi
+                      fi
+
+                      export onboarding_workspace_id="$WORKSPACE_ID"
+                      echo "onboarding_workspace_id=$WORKSPACE_ID"
+                    envVariables:
+                      HARNESS_PLATFORM_API_KEY: <+pipeline.variables.HARNESS_PLATFORM_KEY>
+                      GITHUB_TOKEN: <+pipeline.variables.GITHUB_TOKEN_SECRET>
+                    outputVariables:
+                      - name: onboarding_workspace_id
+        tags: {}
+
+    # =========================================================
+    # Stage 1: IACM Apply — service-onboarding module
+    # Creates: GitHub repo, files, Harness service, IACM
+    # workspace for service-triggers, watcher trigger
+    # =========================================================
+    - stage:
+        name: Onboard Service
+        identifier: Onboard_Service
+        description: "Terraform apply: creates repo, service, workspace, and watcher trigger"
+        type: IACM
+        spec:
+          workspace: <+pipeline.stages.Create_Onboarding_Workspace.spec.execution.steps.create_workspace.output.outputVariables.onboarding_workspace_id>
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: init
+                  identifier: init
+                  timeout: 5m
+                  spec:
+                    command: init
+              - step:
+                  type: IACMTerraformPlugin
+                  name: plan
+                  identifier: plan
+                  timeout: 5m
+                  spec:
+                    command: plan
+              - step:
+                  type: IACMTerraformPlugin
+                  name: apply
+                  identifier: apply
+                  timeout: 10m
+                  spec:
+                    command: apply
+        tags: {}
+
+    # =========================================================
+    # Stage 2: IACM Apply — service-triggers module
+    # Creates: triggers and input sets from triggers.yaml
+    # =========================================================
+    - stage:
+        name: Provision Triggers
+        identifier: Provision_Triggers
+        description: "Terraform apply: reads triggers.yaml and creates Harness triggers + input sets"
+        type: IACM
+        spec:
+          workspace: service_triggers_<+pipeline.variables.service_name.replace("-","_")>
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: init
+                  identifier: init
+                  timeout: 5m
+                  spec:
+                    command: init
+              - step:
+                  type: IACMTerraformPlugin
+                  name: plan
+                  identifier: plan
+                  timeout: 5m
+                  spec:
+                    command: plan
+              - step:
+                  type: IACMTerraformPlugin
+                  name: apply
+                  identifier: apply
+                  timeout: 10m
+                  spec:
+                    command: apply
+        tags: {}

@@ -1,0 +1,214 @@
+pipeline:
+  identifier: trigger_workspace_on_git_file_change
+  name: Trigger Workspace on Git File Change
+  orgIdentifier: Harness_Platform_Management
+  projectIdentifier: Solutions_Factory
+  description: "Generic HSF primitive: wires a Git file merge to an IACM workspace apply. Creates a webhook trigger that auto-fires the target workspace when specified files change."
+  tags:
+    hsf_managed: "true"
+    pipeline_type: "hsf_wiring"
+    created_by: "session_1"
+
+  variables:
+    - name: target_workspace_id
+      type: String
+      required: true
+      description: "Identifier of the IACM workspace to apply on file change"
+      value: <+input>
+
+    - name: repo_org
+      type: String
+      required: true
+      description: "GitHub organization group (RBG, IAA, kru3ish, etc.)"
+      value: <+input>
+
+    - name: repo_name
+      type: String
+      required: true
+      description: "Repository name within the org"
+      value: <+input>
+
+    - name: file_paths
+      type: String
+      required: true
+      description: "Comma-separated list of file paths to watch"
+      value: <+input>.default(.harness/triggers.yaml)
+
+    - name: branch
+      type: String
+      required: false
+      description: "Git branch to watch"
+      value: <+input>.default(main)
+
+    - name: HARNESS_PLATFORM_KEY
+      type: Secret
+      required: true
+      description: "Harness API key for trigger management"
+      value: account.harness_platform_api_key
+
+  stages:
+    - stage:
+        name: Create Watcher Workspace
+        identifier: Create_Watcher_Workspace
+        description: "Creates webhook trigger on the Provision_Workspace_Auto pipeline for auto-apply on file change"
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Create Trigger
+                  identifier: create_trigger
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    command: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      API_KEY="$HARNESS_PLATFORM_API_KEY"
+                      ACCOUNT_ID="<+account.identifier>"
+                      ORG_ID="<+org.identifier>"
+                      PROJECT_ID="<+project.identifier>"
+                      BASE_URL="https://app.harness.io"
+
+                      TARGET_WORKSPACE="<+pipeline.variables.target_workspace_id>"
+                      REPO_ORG="<+pipeline.variables.repo_org>"
+                      REPO_NAME="<+pipeline.variables.repo_name>"
+                      FILE_PATHS="<+pipeline.variables.file_paths>"
+                      BRANCH="<+pipeline.variables.branch>"
+
+                      WATCHER_ID="watcher_${TARGET_WORKSPACE}_$(echo $REPO_NAME | tr '-' '_')"
+                      TRIGGER_ID="trigger_${TARGET_WORKSPACE}_$(echo $REPO_NAME | tr '-' '_')"
+
+                      CONNECTOR_REF="account.github_public"
+                      case "$REPO_ORG" in
+                        kru3ish|RBG|IAA|Kru3ish) CONNECTOR_REF="account.github" ;;
+                      esac
+
+                      echo "=== Creating watcher trigger: $TRIGGER_ID ==="
+                      echo "Target workspace: $TARGET_WORKSPACE"
+                      echo "Repo: $REPO_ORG/$REPO_NAME"
+                      echo "Files: $FILE_PATHS"
+                      echo "Branch: $BRANCH"
+                      echo "Connector: $CONNECTOR_REF"
+
+                      FILE_REGEX=$(echo "$FILE_PATHS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | tr '\n' '|' | sed 's/|$//')
+                      echo "File regex: $FILE_REGEX"
+
+                      cat > /tmp/trigger.yaml << TRIGGEREOF
+                      trigger:
+                        name: "${TRIGGER_ID}"
+                        identifier: "${TRIGGER_ID}"
+                        enabled: true
+                        description: "Auto-apply ${TARGET_WORKSPACE} when files change in ${REPO_ORG}/${REPO_NAME}"
+                        tags:
+                          hsf_managed: "true"
+                          watcher_for: "${TARGET_WORKSPACE}"
+                        orgIdentifier: "${ORG_ID}"
+                        projectIdentifier: "${PROJECT_ID}"
+                        pipelineIdentifier: "Provision_Workspace_Auto"
+                        source:
+                          type: Webhook
+                          spec:
+                            type: Github
+                            spec:
+                              type: Push
+                              spec:
+                                connectorRef: "${CONNECTOR_REF}"
+                                autoAbortPreviousExecutions: false
+                                payloadConditions:
+                                  - key: targetBranch
+                                    operator: Equals
+                                    value: "${BRANCH}"
+                                  - key: changedFiles
+                                    operator: Regex
+                                    value: "${FILE_REGEX}"
+                                headerConditions: []
+                                repoName: "${REPO_NAME}"
+                                actions: []
+                        inputYaml: |
+                          pipeline:
+                            identifier: Provision_Workspace_Auto
+                            stages:
+                              - stage:
+                                  identifier: Provision
+                                  type: IACM
+                                  spec:
+                                    workspace: ${TARGET_WORKSPACE}
+                      TRIGGEREOF
+
+                      echo "--- Generated trigger YAML ---"
+                      cat /tmp/trigger.yaml
+                      echo "---"
+
+                      TRIGGER_YAML=$(cat /tmp/trigger.yaml)
+
+                      EXISTING=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "x-api-key: $API_KEY" \
+                        "$BASE_URL/pipeline/api/triggers/${TRIGGER_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&targetIdentifier=Provision_Workspace_Auto")
+
+                      if [ "$EXISTING" = "200" ]; then
+                        echo "Trigger already exists, updating..."
+                        HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+                          -X PUT \
+                          -H "x-api-key: $API_KEY" \
+                          -H "Content-Type: application/yaml" \
+                          "$BASE_URL/pipeline/api/triggers/${TRIGGER_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&targetIdentifier=Provision_Workspace_Auto" \
+                          --data-raw "$TRIGGER_YAML")
+                      else
+                        echo "Creating new trigger..."
+                        HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+                          -X POST \
+                          -H "x-api-key: $API_KEY" \
+                          -H "Content-Type: application/yaml" \
+                          "$BASE_URL/pipeline/api/triggers?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&targetIdentifier=Provision_Workspace_Auto" \
+                          --data-raw "$TRIGGER_YAML")
+                      fi
+
+                      if [[ "$HTTP_CODE" =~ ^2 ]]; then
+                        echo "Trigger created/updated successfully (HTTP $HTTP_CODE)"
+                      else
+                        echo "ERROR: Failed to create/update trigger (HTTP $HTTP_CODE)"
+                        cat /tmp/response.json
+                        exit 1
+                      fi
+
+                      WEBHOOK_URL="https://app.harness.io/gateway/ng/api/webhook?accountIdentifier=${ACCOUNT_ID}"
+
+                      # Export output variables so Harness CI can capture them
+                      export watcher_workspace_id="$WATCHER_ID"
+                      export webhook_url="$WEBHOOK_URL"
+                      export webhook_trigger_identifier="$TRIGGER_ID"
+
+                      echo ""
+                      echo "=== Outputs ==="
+                      echo "watcher_workspace_id=$watcher_workspace_id"
+                      echo "webhook_url=$webhook_url"
+                      echo "webhook_trigger_identifier=$webhook_trigger_identifier"
+                    outputVariables:
+                      - name: watcher_workspace_id
+                      - name: webhook_url
+                      - name: webhook_trigger_identifier
+                    envVariables:
+                      HARNESS_PLATFORM_API_KEY: <+pipeline.variables.HARNESS_PLATFORM_KEY>
+              - step:
+                  type: Run
+                  name: Export Outputs
+                  identifier: export_outputs
+                  timeout: 1m
+                  spec:
+                    shell: Bash
+                    command: |
+                      echo "Pipeline complete."
+                      echo "Watcher workspace ID: <+execution.steps.create_trigger.output.outputVariables.watcher_workspace_id>"
+                      echo "Webhook URL: <+execution.steps.create_trigger.output.outputVariables.webhook_url>"
+                      echo "Trigger ID: <+execution.steps.create_trigger.output.outputVariables.webhook_trigger_identifier>"
+        tags: {}

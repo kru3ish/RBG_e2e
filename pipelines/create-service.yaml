@@ -1,0 +1,608 @@
+pipeline:
+  identifier: create_service
+  name: Create a Service
+  orgIdentifier: Harness_Platform_Management
+  projectIdentifier: Solutions_Factory
+  description: "HSF Create-a-Service flow: scaffolds a GitHub repo, creates a Harness service, sets up Workspace A (triggers), and wires auto-reconciliation via Session 1's primitive."
+  tags:
+    hsf_managed: "true"
+    pipeline_type: "create_service"
+
+  variables:
+    - name: service_name
+      type: String
+      required: true
+      description: "Service name — becomes the GitHub repo name (lowercase, alphanumeric + hyphens)"
+      value: <+input>
+
+    - name: target_project
+      type: String
+      required: true
+      description: "Harness project where service resources are created"
+      value: <+input>
+
+    - name: target_org
+      type: String
+      required: false
+      description: "Harness org for the target project"
+      value: <+input>.default(Harness_Platform_Management)
+
+    - name: repo_org
+      type: String
+      required: false
+      description: "GitHub organization for the new repo"
+      value: <+input>.default(Kru3ish)
+
+    - name: pipeline_template_id
+      type: String
+      required: false
+      description: "CI pipeline identifier that triggers fire against"
+      value: <+input>.default(Build_and_Push)
+
+    - name: HARNESS_PLATFORM_KEY
+      type: Secret
+      required: true
+      description: "Harness API key for resource management"
+      value: account.harness_platform_api_key
+
+    - name: GITHUB_TOKEN_SECRET
+      type: Secret
+      required: true
+      description: "GitHub token for repo creation"
+      value: account.githubABC
+
+  stages:
+    # =========================================================
+    # Stage 1: Scaffold GitHub Repo
+    # =========================================================
+    - stage:
+        name: Scaffold Repo
+        identifier: Scaffold_Repo
+        description: "Create GitHub repo and seed with initial files"
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Create Repo and Seed Files
+                  identifier: create_repo
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    command: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      SERVICE_NAME="<+pipeline.variables.service_name>"
+                      REPO_ORG="<+pipeline.variables.repo_org>"
+                      GH_TOKEN="$GITHUB_TOKEN"
+                      ACCOUNT_ID="<+account.identifier>"
+
+                      echo "=== Stage 1: Scaffold Repo ==="
+                      echo "Service: $SERVICE_NAME"
+                      echo "Repo org: $REPO_ORG"
+
+                      # Step 1: Create GitHub repo
+                      echo ">> Creating GitHub repo $REPO_ORG/$SERVICE_NAME..."
+                      REPO_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "Authorization: token $GH_TOKEN" \
+                        "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME")
+
+                      if [ "$REPO_EXISTS" = "200" ]; then
+                        echo "   Repo already exists, skipping creation."
+                      else
+                        CREATE_RESP=$(curl -s -w "\n%{http_code}" \
+                          -X POST \
+                          -H "Authorization: token $GH_TOKEN" \
+                          -H "Accept: application/vnd.github.v3+json" \
+                          "https://api.github.com/user/repos" \
+                          -d "{
+                            \"name\": \"$SERVICE_NAME\",
+                            \"description\": \"Service $SERVICE_NAME — created by HSF Create-a-Service\",
+                            \"private\": false,
+                            \"auto_init\": true
+                          }")
+                        HTTP=$(echo "$CREATE_RESP" | tail -1)
+                        if [[ ! "$HTTP" =~ ^2 ]]; then
+                          echo "ERROR: Failed to create repo (HTTP $HTTP)"
+                          echo "$CREATE_RESP" | sed '$d'
+                          exit 1
+                        fi
+                        echo "   Repo created."
+                        sleep 2
+                      fi
+
+                      # Step 2: Seed files using GitHub Contents API
+                      echo ">> Seeding .harness/triggers.yaml..."
+                      TRIGGERS_CONTENT=$(cat <<'YAML_EOF'
+                      triggers:
+                        - path: "*"
+                          events: [pr, main]
+                          image_name: SERVICE_NAME_PLACEHOLDER
+                      YAML_EOF
+                      )
+                      TRIGGERS_CONTENT=$(echo "$TRIGGERS_CONTENT" | sed "s/SERVICE_NAME_PLACEHOLDER/$SERVICE_NAME/g" | sed 's/^                      //')
+                      ENCODED=$(echo "$TRIGGERS_CONTENT" | base64 -w 0 2>/dev/null || echo "$TRIGGERS_CONTENT" | base64)
+
+                      FILE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "Authorization: token $GH_TOKEN" \
+                        "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME/contents/.harness/triggers.yaml")
+
+                      if [ "$FILE_EXISTS" = "200" ]; then
+                        echo "   triggers.yaml already exists, getting SHA..."
+                        FILE_SHA=$(curl -s \
+                          -H "Authorization: token $GH_TOKEN" \
+                          "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME/contents/.harness/triggers.yaml" | \
+                          python3 -c "import json,sys; print(json.load(sys.stdin)['sha'])")
+                        curl -s -o /dev/null \
+                          -X PUT \
+                          -H "Authorization: token $GH_TOKEN" \
+                          "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME/contents/.harness/triggers.yaml" \
+                          -d "{
+                            \"message\": \"Update triggers.yaml via HSF\",
+                            \"content\": \"$ENCODED\",
+                            \"sha\": \"$FILE_SHA\"
+                          }"
+                        echo "   Updated."
+                      else
+                        curl -s -o /dev/null \
+                          -X PUT \
+                          -H "Authorization: token $GH_TOKEN" \
+                          "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME/contents/.harness/triggers.yaml" \
+                          -d "{
+                            \"message\": \"Seed triggers.yaml via HSF Create-a-Service\",
+                            \"content\": \"$ENCODED\"
+                          }"
+                        echo "   Created."
+                      fi
+
+                      # Step 3: Seed Dockerfile
+                      echo ">> Seeding Dockerfile..."
+                      DOCKERFILE_CONTENT="FROM alpine:3.19\nLABEL service=\"$SERVICE_NAME\"\nCMD [\"echo\", \"Hello from $SERVICE_NAME\"]"
+                      DF_ENCODED=$(echo -e "$DOCKERFILE_CONTENT" | base64 -w 0 2>/dev/null || echo -e "$DOCKERFILE_CONTENT" | base64)
+
+                      DF_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "Authorization: token $GH_TOKEN" \
+                        "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME/contents/Dockerfile")
+
+                      if [ "$DF_EXISTS" != "200" ]; then
+                        curl -s -o /dev/null \
+                          -X PUT \
+                          -H "Authorization: token $GH_TOKEN" \
+                          "https://api.github.com/repos/$REPO_ORG/$SERVICE_NAME/contents/Dockerfile" \
+                          -d "{
+                            \"message\": \"Add Dockerfile via HSF Create-a-Service\",
+                            \"content\": \"$DF_ENCODED\"
+                          }"
+                        echo "   Created."
+                      else
+                        echo "   Already exists, skipping."
+                      fi
+
+                      # Export outputs
+                      export repo_full_name="$REPO_ORG/$SERVICE_NAME"
+                      export repo_url="https://github.com/$REPO_ORG/$SERVICE_NAME"
+                      export repo_default_branch="main"
+
+                      echo ""
+                      echo "=== Stage 1 Outputs ==="
+                      echo "repo_full_name=$repo_full_name"
+                      echo "repo_url=$repo_url"
+                      echo "repo_default_branch=$repo_default_branch"
+                    envVariables:
+                      GITHUB_TOKEN: <+pipeline.variables.GITHUB_TOKEN_SECRET>
+                    outputVariables:
+                      - name: repo_full_name
+                      - name: repo_url
+                      - name: repo_default_branch
+        tags: {}
+
+    # =========================================================
+    # Stage 2: Create Harness Service
+    # =========================================================
+    - stage:
+        name: Create Harness Service
+        identifier: Create_Harness_Service
+        description: "Create a Harness service resource in the target project"
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Create Service via API
+                  identifier: create_service_api
+                  timeout: 3m
+                  spec:
+                    shell: Bash
+                    command: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      API_KEY="$HARNESS_PLATFORM_API_KEY"
+                      ACCOUNT_ID="<+account.identifier>"
+                      TARGET_ORG="<+pipeline.variables.target_org>"
+                      TARGET_PROJECT="<+pipeline.variables.target_project>"
+                      SERVICE_NAME="<+pipeline.variables.service_name>"
+                      SERVICE_ID=$(echo "$SERVICE_NAME" | tr '-' '_')
+
+                      echo "=== Stage 2: Create Harness Service ==="
+                      echo "Service: $SERVICE_ID in $TARGET_ORG/$TARGET_PROJECT"
+
+                      # Check if service exists
+                      SVC_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "x-api-key: $API_KEY" \
+                        "https://app.harness.io/gateway/ng/api/servicesV2/$SERVICE_ID?accountIdentifier=$ACCOUNT_ID&orgIdentifier=$TARGET_ORG&projectIdentifier=$TARGET_PROJECT")
+
+                      if [ "$SVC_EXISTS" = "200" ]; then
+                        echo "   Service already exists, skipping."
+                      else
+                        RESP=$(curl -s -w "\n%{http_code}" \
+                          -X POST \
+                          -H "x-api-key: $API_KEY" \
+                          -H "Content-Type: application/json" \
+                          "https://app.harness.io/gateway/ng/api/servicesV2?accountIdentifier=$ACCOUNT_ID" \
+                          -d "{
+                            \"orgIdentifier\": \"$TARGET_ORG\",
+                            \"projectIdentifier\": \"$TARGET_PROJECT\",
+                            \"identifier\": \"$SERVICE_ID\",
+                            \"name\": \"$SERVICE_NAME\",
+                            \"description\": \"Service created by HSF Create-a-Service workflow\",
+                            \"tags\": {
+                              \"managed_by\": \"hsf\",
+                              \"created_via\": \"create_service_workflow\",
+                              \"service_name\": \"$SERVICE_NAME\"
+                            }
+                          }")
+                        HTTP=$(echo "$RESP" | tail -1)
+                        BODY=$(echo "$RESP" | sed '$d')
+                        if [[ "$HTTP" =~ ^2 ]]; then
+                          echo "   Service created successfully."
+                        else
+                          echo "ERROR: Failed to create service (HTTP $HTTP)"
+                          echo "$BODY"
+                          exit 1
+                        fi
+                      fi
+
+                      export service_identifier="$SERVICE_ID"
+
+                      echo ""
+                      echo "=== Stage 2 Outputs ==="
+                      echo "service_identifier=$service_identifier"
+                    envVariables:
+                      HARNESS_PLATFORM_API_KEY: <+pipeline.variables.HARNESS_PLATFORM_KEY>
+                    outputVariables:
+                      - name: service_identifier
+        tags: {}
+
+    # =========================================================
+    # Stage 3: Create Workspace A (service-triggers)
+    # =========================================================
+    - stage:
+        name: Create Workspace A
+        identifier: Create_Workspace_A
+        description: "Create IACM workspace that manages triggers/input sets from triggers.yaml"
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Create and Apply Workspace A
+                  identifier: create_workspace_a
+                  timeout: 10m
+                  spec:
+                    shell: Bash
+                    command: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      API_KEY="$HARNESS_PLATFORM_API_KEY"
+                      ACCOUNT_ID="<+account.identifier>"
+                      HSF_ORG="<+org.identifier>"
+                      HSF_PROJECT="<+project.identifier>"
+                      BASE_URL="https://app.harness.io"
+
+                      SERVICE_NAME="<+pipeline.variables.service_name>"
+                      TARGET_ORG="<+pipeline.variables.target_org>"
+                      TARGET_PROJECT="<+pipeline.variables.target_project>"
+                      REPO_ORG="<+pipeline.variables.repo_org>"
+                      PIPELINE_TEMPLATE="<+pipeline.variables.pipeline_template_id>"
+                      REPO_FULL_NAME="<+pipeline.stages.Scaffold_Repo.spec.execution.steps.create_repo.output.outputVariables.repo_full_name>"
+
+                      WORKSPACE_ID="service_triggers_$(echo $SERVICE_NAME | tr '-' '_')"
+
+                      echo "=== Stage 3: Create Workspace A ==="
+                      echo "Workspace: $WORKSPACE_ID"
+                      echo "Repo: $REPO_FULL_NAME"
+                      echo "Target: $TARGET_ORG/$TARGET_PROJECT"
+
+                      # Check if workspace exists
+                      WS_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "x-api-key: $API_KEY" \
+                        "$BASE_URL/iacm/api/orgs/$HSF_ORG/projects/$HSF_PROJECT/workspaces/$WORKSPACE_ID?account_id=$ACCOUNT_ID")
+
+                      if [ "$WS_EXISTS" = "200" ]; then
+                        echo "   Workspace already exists, skipping creation."
+                      else
+                        echo ">> Creating workspace $WORKSPACE_ID..."
+                        RESP=$(curl -s -w "\n%{http_code}" \
+                          -X POST \
+                          -H "x-api-key: $API_KEY" \
+                          -H "Content-Type: application/json" \
+                          "$BASE_URL/iacm/api/orgs/$HSF_ORG/projects/$HSF_PROJECT/workspaces?account_id=$ACCOUNT_ID" \
+                          -d "{
+                            \"identifier\": \"$WORKSPACE_ID\",
+                            \"name\": \"Service Triggers: $SERVICE_NAME\",
+                            \"description\": \"Manages triggers and input sets for $SERVICE_NAME by reading .harness/triggers.yaml\",
+                            \"provisioner\": \"opentofu\",
+                            \"provisioner_version\": \"1.9.0\",
+                            \"repository\": \"kru3ish/RBG_e2e\",
+                            \"repository_connector\": \"account.github_public\",
+                            \"repository_branch\": \"main\",
+                            \"repository_path\": \"modules/service-triggers\",
+                            \"provider_connector\": \"\",
+                            \"terraform_variables\": {
+                              \"v1\": {\"key\": \"harness_account_id\", \"value\": \"$ACCOUNT_ID\", \"value_type\": \"string\"},
+                              \"v2\": {\"key\": \"org_id\", \"value\": \"$TARGET_ORG\", \"value_type\": \"string\"},
+                              \"v3\": {\"key\": \"project_id\", \"value\": \"$TARGET_PROJECT\", \"value_type\": \"string\"},
+                              \"v4\": {\"key\": \"repo_full_name\", \"value\": \"$REPO_FULL_NAME\", \"value_type\": \"string\"},
+                              \"v5\": {\"key\": \"github_connector_ref\", \"value\": \"account.github\", \"value_type\": \"string\"},
+                              \"v6\": {\"key\": \"pipeline_identifier\", \"value\": \"$PIPELINE_TEMPLATE\", \"value_type\": \"string\"},
+                              \"v7\": {\"key\": \"github_token\", \"value\": \"\", \"value_type\": \"string\"},
+                              \"v8\": {\"key\": \"harness_platform_api_key\", \"value\": \"$API_KEY\", \"value_type\": \"string\"}
+                            },
+                            \"environment_variables\": {},
+                            \"tags\": {
+                              \"managed_by\": \"hsf\",
+                              \"created_via\": \"create_service_workflow\",
+                              \"service_name\": \"$SERVICE_NAME\"
+                            }
+                          }")
+                        HTTP=$(echo "$RESP" | tail -1)
+                        BODY=$(echo "$RESP" | sed '$d')
+                        if [[ "$HTTP" =~ ^2 ]]; then
+                          echo "   Workspace created."
+                        else
+                          echo "ERROR: Failed to create workspace (HTTP $HTTP)"
+                          echo "$BODY"
+                          exit 1
+                        fi
+                      fi
+
+                      # Trigger Provision_Workspace_Auto to apply Workspace A (no approval gate)
+                      echo ""
+                      echo ">> Triggering Provision_Workspace_Auto for $WORKSPACE_ID..."
+                      PROVISION_INPUT="pipeline:
+                        identifier: Provision_Workspace_Auto
+                        stages:
+                          - stage:
+                              identifier: Provision
+                              type: IACM
+                              spec:
+                                workspace: $WORKSPACE_ID"
+
+                      EXEC_RESP=$(curl -s -w "\n%{http_code}" \
+                        -X POST \
+                        -H "x-api-key: $API_KEY" \
+                        -H "Content-Type: application/yaml" \
+                        "$BASE_URL/pipeline/api/pipeline/execute/Provision_Workspace_Auto?accountIdentifier=$ACCOUNT_ID&orgIdentifier=$HSF_ORG&projectIdentifier=$HSF_PROJECT&moduleType=IACM" \
+                        --data-raw "$PROVISION_INPUT")
+
+                      EXEC_HTTP=$(echo "$EXEC_RESP" | tail -1)
+                      EXEC_BODY=$(echo "$EXEC_RESP" | sed '$d')
+
+                      if [[ ! "$EXEC_HTTP" =~ ^2 ]]; then
+                        echo "ERROR: Failed to trigger Provision_Workspace (HTTP $EXEC_HTTP)"
+                        echo "$EXEC_BODY"
+                        exit 1
+                      fi
+
+                      EXEC_ID=$(echo "$EXEC_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['planExecution']['uuid'])")
+                      echo "   Execution started: $EXEC_ID"
+
+                      # Poll for completion (max 5 minutes)
+                      echo ">> Waiting for Provision_Workspace to complete..."
+                      for i in $(seq 1 30); do
+                        sleep 10
+                        STATUS=$(curl -s \
+                          -H "x-api-key: $API_KEY" \
+                          "$BASE_URL/pipeline/api/pipelines/execution/v2/$EXEC_ID?accountIdentifier=$ACCOUNT_ID&orgIdentifier=$HSF_ORG&projectIdentifier=$HSF_PROJECT" | \
+                          python3 -c "import json,sys; print(json.load(sys.stdin).get('data',{}).get('pipelineExecutionSummary',{}).get('status','Unknown'))")
+                        echo "   [$i/30] Status: $STATUS"
+                        if [ "$STATUS" = "Success" ]; then
+                          echo "   Workspace A applied successfully!"
+                          break
+                        elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Aborted" ] || [ "$STATUS" = "Expired" ]; then
+                          echo "ERROR: Provision_Workspace failed with status: $STATUS"
+                          exit 1
+                        fi
+                      done
+
+                      if [ "$STATUS" != "Success" ]; then
+                        echo "ERROR: Provision_Workspace timed out (status: $STATUS)"
+                        exit 1
+                      fi
+
+                      export workspace_a_id="$WORKSPACE_ID"
+
+                      echo ""
+                      echo "=== Stage 3 Outputs ==="
+                      echo "workspace_a_id=$workspace_a_id"
+                    envVariables:
+                      HARNESS_PLATFORM_API_KEY: <+pipeline.variables.HARNESS_PLATFORM_KEY>
+                    outputVariables:
+                      - name: workspace_a_id
+        tags: {}
+
+    # =========================================================
+    # Stage 4: Wire Auto-Apply (calls Session 1's primitive)
+    # =========================================================
+    - stage:
+        name: Wire Auto Apply
+        identifier: Wire_Auto_Apply
+        description: "Call trigger_workspace_on_git_file_change to create Workspace B (the watcher)"
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Call Session 1 Pipeline
+                  identifier: call_session1
+                  timeout: 10m
+                  spec:
+                    shell: Bash
+                    command: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      API_KEY="$HARNESS_PLATFORM_API_KEY"
+                      ACCOUNT_ID="<+account.identifier>"
+                      HSF_ORG="<+org.identifier>"
+                      HSF_PROJECT="<+project.identifier>"
+                      BASE_URL="https://app.harness.io"
+
+                      SERVICE_NAME="<+pipeline.variables.service_name>"
+                      REPO_ORG="<+pipeline.variables.repo_org>"
+                      WORKSPACE_A_ID="<+pipeline.stages.Create_Workspace_A.spec.execution.steps.create_workspace_a.output.outputVariables.workspace_a_id>"
+
+                      echo "=== Stage 4: Wire Auto-Apply ==="
+                      echo "Calling trigger_workspace_on_git_file_change"
+                      echo "  target_workspace_id: $WORKSPACE_A_ID"
+                      echo "  repo_org: $REPO_ORG"
+                      echo "  repo_name: $SERVICE_NAME"
+                      echo "  file_paths: .harness/triggers.yaml"
+                      echo "  branch: main"
+
+                      INPUT_YAML="pipeline:
+                        identifier: trigger_workspace_on_git_file_change
+                        variables:
+                          - name: target_workspace_id
+                            type: String
+                            value: $WORKSPACE_A_ID
+                          - name: repo_org
+                            type: String
+                            value: $REPO_ORG
+                          - name: repo_name
+                            type: String
+                            value: $SERVICE_NAME
+                          - name: file_paths
+                            type: String
+                            value: .harness/triggers.yaml
+                          - name: branch
+                            type: String
+                            value: main
+                          - name: HARNESS_PLATFORM_KEY
+                            type: Secret
+                            value: account.harness_platform_api_key"
+
+                      EXEC_RESP=$(curl -s -w "\n%{http_code}" \
+                        -X POST \
+                        -H "x-api-key: $API_KEY" \
+                        -H "Content-Type: application/yaml" \
+                        "$BASE_URL/pipeline/api/pipeline/execute/trigger_workspace_on_git_file_change?accountIdentifier=$ACCOUNT_ID&orgIdentifier=$HSF_ORG&projectIdentifier=$HSF_PROJECT&moduleType=CI" \
+                        --data-raw "$INPUT_YAML")
+
+                      EXEC_HTTP=$(echo "$EXEC_RESP" | tail -1)
+                      EXEC_BODY=$(echo "$EXEC_RESP" | sed '$d')
+
+                      if [[ ! "$EXEC_HTTP" =~ ^2 ]]; then
+                        echo "ERROR: Failed to trigger Session 1 pipeline (HTTP $EXEC_HTTP)"
+                        echo "$EXEC_BODY"
+                        exit 1
+                      fi
+
+                      EXEC_ID=$(echo "$EXEC_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['planExecution']['uuid'])")
+                      echo "   Execution started: $EXEC_ID"
+
+                      # Poll for completion
+                      echo ">> Waiting for trigger_workspace_on_git_file_change to complete..."
+                      STATUS="Running"
+                      for i in $(seq 1 30); do
+                        sleep 10
+                        STATUS=$(curl -s \
+                          -H "x-api-key: $API_KEY" \
+                          "$BASE_URL/pipeline/api/pipelines/execution/v2/$EXEC_ID?accountIdentifier=$ACCOUNT_ID&orgIdentifier=$HSF_ORG&projectIdentifier=$HSF_PROJECT" | \
+                          python3 -c "import json,sys; print(json.load(sys.stdin).get('data',{}).get('pipelineExecutionSummary',{}).get('status','Unknown'))")
+                        echo "   [$i/30] Status: $STATUS"
+                        if [ "$STATUS" = "Success" ]; then
+                          echo "   Session 1 pipeline completed successfully!"
+                          break
+                        elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Aborted" ] || [ "$STATUS" = "Expired" ]; then
+                          echo "ERROR: Session 1 pipeline failed with status: $STATUS"
+                          exit 1
+                        fi
+                      done
+
+                      if [ "$STATUS" != "Success" ]; then
+                        echo "ERROR: Session 1 pipeline timed out (status: $STATUS)"
+                        exit 1
+                      fi
+
+                      # Get outputs from Session 1's execution
+                      EXEC_DETAILS=$(curl -s \
+                        -H "x-api-key: $API_KEY" \
+                        "$BASE_URL/pipeline/api/pipelines/execution/v2/$EXEC_ID?accountIdentifier=$ACCOUNT_ID&orgIdentifier=$HSF_ORG&projectIdentifier=$HSF_PROJECT&renderFullBottomGraph=true")
+
+                      export watcher_workspace_id=$(echo "$EXEC_DETAILS" | python3 -c "
+                      import json, sys
+                      data = json.load(sys.stdin).get('data', {})
+                      graph = data.get('executionGraph', {}).get('nodeMap', {})
+                      for nid, n in graph.items():
+                          if n.get('name') == 'Create Trigger':
+                              outcomes = n.get('outcomes', {})
+                              for ok, ov in outcomes.items():
+                                  if isinstance(ov, dict) and 'outputVariables' in str(ov):
+                                      ovars = ov.get('outputVariables', {})
+                                      if 'watcher_workspace_id' in ovars:
+                                          print(ovars['watcher_workspace_id'])
+                                          sys.exit(0)
+                      print('unknown')
+                      " 2>/dev/null || echo "watcher_$(echo $WORKSPACE_A_ID | tr '-' '_')_$(echo $SERVICE_NAME | tr '-' '_')")
+
+                      export webhook_url="https://app.harness.io/gateway/ng/api/webhook?accountIdentifier=$ACCOUNT_ID"
+                      export webhook_trigger_id="trigger_${WORKSPACE_A_ID}_$(echo $SERVICE_NAME | tr '-' '_')"
+
+                      echo ""
+                      echo "=== Stage 4 Outputs ==="
+                      echo "watcher_workspace_id=$watcher_workspace_id"
+                      echo "webhook_url=$webhook_url"
+                      echo "webhook_trigger_id=$webhook_trigger_id"
+                    envVariables:
+                      HARNESS_PLATFORM_API_KEY: <+pipeline.variables.HARNESS_PLATFORM_KEY>
+                    outputVariables:
+                      - name: watcher_workspace_id
+                      - name: webhook_url
+                      - name: webhook_trigger_id
+        tags: {}

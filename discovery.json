@@ -1,0 +1,73 @@
+{
+  "account_id": "Qjf4MwsLRUes1w_efM3eIw",
+  "hsf_org": "Harness_Platform_Management",
+  "hsf_project": "Solutions_Factory",
+  "github_connectors": {
+    "account_level": [
+      {
+        "identifier": "github",
+        "name": "github",
+        "url": "https://github.com/kru3ish",
+        "type": "Account",
+        "token_ref": "account.githubABC"
+      },
+      {
+        "identifier": "github_public",
+        "name": "GitHub Public",
+        "url": "https://github.com",
+        "type": "Account",
+        "token_ref": "account.githubABC"
+      }
+    ]
+  },
+  "connector_map": {
+    "kru3ish": "account.github",
+    "Kru3ish": "account.github",
+    "default": "account.github_public"
+  },
+  "build_infrastructure": {
+    "type": "Cloud",
+    "os": "Linux",
+    "arch": "Amd64",
+    "note": "HSF uses Harness Cloud — no Kubernetes connector needed"
+  },
+  "existing_pipelines": {
+    "Provision_Workspace": {
+      "identifier": "Provision_Workspace",
+      "name": "Provision Workspace",
+      "description": "HSF provided pipeline intended to Provision an IACM workspace",
+      "workspace_input": "<+input>",
+      "stage_identifier": "Provision"
+    },
+    "trigger_workspace_on_git_file_change": {
+      "identifier": "trigger_workspace_on_git_file_change",
+      "name": "Trigger Workspace on Git File Change",
+      "description": "Session 1 primitive — wires a Git file merge to an IACM workspace apply",
+      "status": "WORKING"
+    }
+  },
+  "existing_workspaces": [
+    "CI_GOLDEN_STANDARDS",
+    "harness-pilot-light",
+    "harness-solutions-factory",
+    "hsf_wiring_test_target"
+  ],
+  "secrets": {
+    "harness_platform_api_key": "account.harness_platform_api_key",
+    "github_token": "account.githubABC"
+  },
+  "developer_projects": [
+    { "identifier": "Solutions_Factory", "name": "Solutions Factory", "org": "Harness_Platform_Management" },
+    { "identifier": "Image_Factory", "name": "Image Factory", "org": "Harness_Platform_Management" },
+    { "identifier": "Core", "name": "Core", "org": "Platform" },
+    { "identifier": "Sandbox", "name": "Sandbox", "org": "Playground" },
+    { "identifier": "default_project", "name": "Default Project", "org": "default" }
+  ],
+  "discovery_gaps": [
+    "No RBMarketplace GitHub connector exists — connector_map uses account.github for Kru3ish org only",
+    "No IAA GitHub connector exists",
+    "No Kubernetes connector — HSF uses Harness Cloud (runtime: Cloud), not K8s",
+    "No existing CI pipeline template for containerize-and-push — Stage 3 trigger targets will need a pipeline_identifier input",
+    "Developer project list is manually curated — no 'developer' tag on projects to auto-filter"
+  ]
+}
